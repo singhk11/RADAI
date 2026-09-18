@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+
+import os
+import re
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
+try:
+    import torch
+    from bert_score import score as bert_score
+except ImportError as e:
+    raise ImportError(
+        'Missing dependency for BERTScore analysis. Install with: pip install bert-score torch'
+    ) from e
+
+
+DATA_PATH = '/data/aiiih/projects/singhk/radai/Data/CCF_dataset_wmetadata_v3.csv'
+OUTPUT_DIR = '/data/aiiih/projects/singhk/radai/Output/BERT_Score_Analysis'
+
+MIN_RADAI_CASES = 100
+PRE_CUTOFF = pd.Timestamp('2025-06-02')
+POST_START = pd.Timestamp('2025-07-01')
+
+BATCH_SIZE = int(os.environ.get('BERTSCORE_BATCH_SIZE', '8'))
+# Use a long-context clinical model so full impressions can be compared without truncation.
+MODEL_TYPE = os.environ.get(
+    'BERTSCORE_MODEL_TYPE',
+    'yikuan8/Clinical-Longformer',
+)
+RESCALE_WITH_BASELINE = False
+NUM_LAYERS = int(os.environ.get('BERTSCORE_NUM_LAYERS', '12'))
+NUM_SHARDS = int(os.environ.get('BERTSCORE_NUM_SHARDS', '1'))
+SHARD_INDEX = int(os.environ.get('BERTSCORE_SHARD_INDEX', '0'))
+
+# Outputs go into a model-specific subdirectory so previous results are preserved.
+_model_slug = MODEL_TYPE.replace('/', '_').replace('-', '_')
+_out_subdir = os.path.join(OUTPUT_DIR, _model_slug)
+os.makedirs(_out_subdir, exist_ok=True)
+
+if NUM_SHARDS < 1:
+    raise ValueError('BERTSCORE_NUM_SHARDS must be >= 1')
+if SHARD_INDEX < 0 or SHARD_INDEX >= NUM_SHARDS:
+    raise ValueError('BERTSCORE_SHARD_INDEX must satisfy 0 <= index < BERTSCORE_NUM_SHARDS')
+
+if NUM_SHARDS > 1:
+    _run_subdir = os.path.join(_out_subdir, f'shard_{SHARD_INDEX:03d}_of_{NUM_SHARDS:03d}')
+else:
+    _run_subdir = _out_subdir
+os.makedirs(_run_subdir, exist_ok=True)
+
+OUT_USED_ROWS = f'{_run_subdir}/bert_score_period_modality_region_unique_pairs_used.csv'
+OUT_PERIOD = f'{_run_subdir}/bert_score_by_period.csv'
+OUT_PERIOD_MODALITY = f'{_run_subdir}/bert_score_by_period_modality.csv'
+OUT_PERIOD_MODALITY_REGION = f'{_run_subdir}/bert_score_by_period_modality_anatomic_region.csv'
+OUT_KW_PERIOD_MODALITY = f'{_run_subdir}/bert_f1_kruskal_by_period_modality.csv'
+OUT_KW_PERIOD_MODALITY_REGION = f'{_run_subdir}/bert_f1_kruskal_by_period_modality_anatomic_region.csv'
+OUT_RESULTS = f'{_run_subdir}/bert_score_period_modality_region_results.txt'
+
+
+def clean_field(val):
+    if pd.isna(val):
+        return ''
+    s = str(val).strip()
+    if s.lower() in ('nan', 'na', 'none'):
+        return ''
+    s = re.sub(r'^impression\s*:?\s*', '', s, flags=re.IGNORECASE).strip()
+    s = s.rstrip('\n').strip()
+    return s
+
+
+def summarize(df, group_cols):
+    rows = []
+    for keys, g in df.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = {c: v for c, v in zip(group_cols, keys)}
+        row.update(
+            {
+                'n_rows': int(len(g)),
+                'bert_precision_mean': float(g['bert_precision'].mean()),
+                'bert_precision_median': float(g['bert_precision'].median()),
+                'bert_precision_std': float(g['bert_precision'].std()),
+                'bert_recall_mean': float(g['bert_recall'].mean()),
+                'bert_recall_median': float(g['bert_recall'].median()),
+                'bert_recall_std': float(g['bert_recall'].std()),
+                'bert_f1_mean': float(g['bert_f1'].mean()),
+                'bert_f1_median': float(g['bert_f1'].median()),
+                'bert_f1_std': float(g['bert_f1'].std()),
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def compute_bert_scores(final_texts, draft_texts):
+    n = len(final_texts)
+    p = np.full(n, np.nan)
+    r = np.full(n, np.nan)
+    f1 = np.full(n, np.nan)
+
+    # Keep blank finals to mirror prior edit-distance workflow; treat as no-edit.
+    # If final impression is blank, interpret as unchanged from draft.
+    non_blank_mask = np.array([str(t).strip() != '' for t in final_texts], dtype=bool)
+    non_blank_idx = np.flatnonzero(non_blank_mask)
+    blank_idx = np.flatnonzero(~non_blank_mask)
+    if blank_idx.size > 0:
+        p[blank_idx] = 1.0
+        r[blank_idx] = 1.0
+        f1[blank_idx] = 1.0
+
+    if non_blank_idx.size == 0:
+        return p, r, f1
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    n_batches = int(np.ceil(len(non_blank_idx) / BATCH_SIZE))
+    batch_starts = range(0, len(non_blank_idx), BATCH_SIZE)
+    if tqdm is not None:
+        batch_starts = tqdm(
+            batch_starts,
+            total=n_batches,
+            desc='BERTScore batches',
+            unit='batch',
+            leave=True,
+        )
+
+    for start in batch_starts:
+        batch_ids = non_blank_idx[start:start + BATCH_SIZE]
+        cands = [final_texts[i] for i in batch_ids]
+        refs = [draft_texts[i] for i in batch_ids]
+
+        batch_p, batch_r, batch_f1 = bert_score(
+            cands,
+            refs,
+            model_type=MODEL_TYPE,
+            num_layers=NUM_LAYERS,
+            lang='en',
+            device=device,
+            rescale_with_baseline=RESCALE_WITH_BASELINE,
+            verbose=False,
+        )
+
+        p[batch_ids] = batch_p.detach().cpu().numpy()
+        r[batch_ids] = batch_r.detach().cpu().numpy()
+        f1[batch_ids] = batch_f1.detach().cpu().numpy()
+
+    return p, r, f1
+
+
+def kruskal_modalities_within_period(df, min_group_n=5):
+    rows = []
+    for period, g_period in df.groupby('period', dropna=False):
+        modality_groups = []
+        modality_names = []
+        modality_ns = []
+
+        for modality, g_mod in g_period.groupby('modality', dropna=False):
+            vals = g_mod['bert_f1'].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if len(vals) >= min_group_n:
+                modality_groups.append(vals)
+                modality_names.append(str(modality))
+                modality_ns.append(int(len(vals)))
+
+        if len(modality_groups) >= 2:
+            h_stat, p_value = stats.kruskal(*modality_groups)
+            rows.append(
+                {
+                    'period': period,
+                    'n_modalities_tested': int(len(modality_groups)),
+                    'n_rows_tested': int(sum(modality_ns)),
+                    'modalities_tested': '|'.join(modality_names),
+                    'group_sizes': '|'.join(str(x) for x in modality_ns),
+                    'kw_h': float(h_stat),
+                    'kw_p': float(p_value),
+                    'kw_significant_p_lt_0_05': bool(p_value < 0.05),
+                }
+            )
+        else:
+            rows.append(
+                {
+                    'period': period,
+                    'n_modalities_tested': int(len(modality_groups)),
+                    'n_rows_tested': int(sum(modality_ns)),
+                    'modalities_tested': '|'.join(modality_names),
+                    'group_sizes': '|'.join(str(x) for x in modality_ns),
+                    'kw_h': np.nan,
+                    'kw_p': np.nan,
+                    'kw_significant_p_lt_0_05': False,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def kruskal_regions_within_period_modality(df, min_group_n=5):
+    rows = []
+    for (period, modality), g_pm in df.groupby(['period', 'modality'], dropna=False):
+        region_groups = []
+        region_names = []
+        region_ns = []
+
+        for region, g_reg in g_pm.groupby('anatomic_region', dropna=False):
+            vals = g_reg['bert_f1'].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if len(vals) >= min_group_n:
+                region_groups.append(vals)
+                region_names.append(str(region))
+                region_ns.append(int(len(vals)))
+
+        if len(region_groups) >= 2:
+            h_stat, p_value = stats.kruskal(*region_groups)
+            rows.append(
+                {
+                    'period': period,
+                    'modality': modality,
+                    'n_regions_tested': int(len(region_groups)),
+                    'n_rows_tested': int(sum(region_ns)),
+                    'regions_tested': '|'.join(region_names),
+                    'group_sizes': '|'.join(str(x) for x in region_ns),
+                    'kw_h': float(h_stat),
+                    'kw_p': float(p_value),
+                    'kw_significant_p_lt_0_05': bool(p_value < 0.05),
+                }
+            )
+        else:
+            rows.append(
+                {
+                    'period': period,
+                    'modality': modality,
+                    'n_regions_tested': int(len(region_groups)),
+                    'n_rows_tested': int(sum(region_ns)),
+                    'regions_tested': '|'.join(region_names),
+                    'group_sizes': '|'.join(str(x) for x in region_ns),
+                    'kw_h': np.nan,
+                    'kw_p': np.nan,
+                    'kw_significant_p_lt_0_05': False,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    usecols = [
+        'radiologist_id',
+        'collected_timestamp',
+        'n_inferences',
+        'omni_impression',
+        'impression',
+        'modality_server',
+        'modality_desc',
+        'body_part',
+    ]
+    df = pd.read_csv(DATA_PATH, usecols=usecols, low_memory=False)
+    total_rows_raw = len(df)
+
+    # Keep same cohort rule: valid radiologist_id + >=100 RADAI cases.
+    df['radiologist_id'] = df['radiologist_id'].astype(str).str.strip()
+    df.loc[df['radiologist_id'].str.lower().isin(['', 'nan', 'na', 'none']), 'radiologist_id'] = np.nan
+
+    is_radai_any = pd.to_numeric(df['n_inferences'], errors='coerce').fillna(0).ge(1)
+    radai_counts = df.loc[is_radai_any & df['radiologist_id'].notna()].groupby('radiologist_id').size()
+    eligible_rads = set(radai_counts[radai_counts >= MIN_RADAI_CASES].index)
+    df = df[df['radiologist_id'].isin(eligible_rads)].copy()
+
+    # RADAI rows only.
+    df = df[pd.to_numeric(df['n_inferences'], errors='coerce').fillna(0).ge(1)].copy()
+
+    # Implementation period assignment.
+    df['ts'] = pd.to_datetime(df['collected_timestamp'], errors='coerce')
+    df = df[df['ts'].notna()].copy()
+    df['period'] = np.where(df['ts'] <= PRE_CUTOFF, 'pre', np.where(df['ts'] >= POST_START, 'post', 'gap'))
+    df = df[df['period'].isin(['pre', 'post'])].copy()
+
+    # Text cleaning.
+    df['omni_clean'] = df['omni_impression'].apply(clean_field)
+    df['impression_clean'] = df['impression'].apply(clean_field)
+
+    # Need valid draft baseline.
+    df = df[df['omni_clean'] != ''].copy()
+
+    # Keep strictly unique draft/final impression pairs (frequency == 1).
+    pair_counts = (
+        df.groupby(['omni_clean', 'impression_clean'], dropna=False)
+        .size()
+        .rename('pair_count')
+        .reset_index()
+    )
+    df = df.merge(pair_counts, on=['omni_clean', 'impression_clean'], how='left')
+    df_unique = df[df['pair_count'] == 1].copy()
+    df_unique = df_unique.reset_index(drop=True)
+    df_unique['global_pair_index'] = np.arange(len(df_unique), dtype=np.int64)
+
+    if NUM_SHARDS > 1:
+        df_unique = df_unique[df_unique['global_pair_index'] % NUM_SHARDS == SHARD_INDEX].copy()
+
+    # Region and modality harmonization.
+    df_unique['modality'] = (
+        df_unique['modality_server']
+        .fillna(df_unique['modality_desc'])
+        .fillna('UNKNOWN')
+        .astype(str)
+        .str.strip()
+    )
+    df_unique.loc[df_unique['modality'].str.lower().isin(['', 'nan', 'na', 'none']), 'modality'] = 'UNKNOWN'
+    df_unique.loc[df_unique['modality'].str.upper() == 'COMPUTED TOMOGRAPHY', 'modality'] = 'CT'
+
+    df_unique['anatomic_region'] = df_unique['body_part'].fillna('UNKNOWN').astype(str).str.strip()
+    df_unique.loc[df_unique['anatomic_region'].str.lower().isin(['', 'nan', 'na', 'none']), 'anatomic_region'] = 'UNKNOWN'
+
+    # Compute BERTScore between draft (reference) and final (candidate) impressions.
+    precision, recall, f1 = compute_bert_scores(
+        df_unique['impression_clean'].tolist(),
+        df_unique['omni_clean'].tolist(),
+    )
+    df_unique['bert_precision'] = precision
+    df_unique['bert_recall'] = recall
+    df_unique['bert_f1'] = f1
+    df_unique = df_unique[np.isfinite(df_unique['bert_f1'])].copy()
+
+    # Summaries.
+    period_df = summarize(df_unique, ['period']).sort_values('period')
+    period_mod_df = summarize(df_unique, ['period', 'modality']).sort_values(['period', 'n_rows'], ascending=[True, False])
+    period_mod_reg_df = summarize(df_unique, ['period', 'modality', 'anatomic_region']).sort_values(
+        ['period', 'modality', 'n_rows'], ascending=[True, True, False]
+    )
+    kw_period_mod_df = kruskal_modalities_within_period(df_unique).sort_values('period')
+    kw_period_mod_reg_df = kruskal_regions_within_period_modality(df_unique).sort_values(['period', 'modality'])
+
+    # Save outputs.
+    cols_used = [
+        'radiologist_id',
+        'period',
+        'modality',
+        'anatomic_region',
+        'omni_clean',
+        'impression_clean',
+        'pair_count',
+        'bert_precision',
+        'bert_recall',
+        'bert_f1',
+    ]
+    df_unique[cols_used].to_csv(OUT_USED_ROWS, index=False)
+    period_df.to_csv(OUT_PERIOD, index=False)
+    period_mod_df.to_csv(OUT_PERIOD_MODALITY, index=False)
+    period_mod_reg_df.to_csv(OUT_PERIOD_MODALITY_REGION, index=False)
+    kw_period_mod_df.to_csv(OUT_KW_PERIOD_MODALITY, index=False)
+    kw_period_mod_reg_df.to_csv(OUT_KW_PERIOD_MODALITY_REGION, index=False)
+
+    with open(OUT_RESULTS, 'w') as f:
+        f.write('BERTSCORE ANALYSIS STRATIFIED BY IMPLEMENTATION PERIOD / MODALITY / ANATOMIC REGION\n')
+        f.write('=' * 100 + '\n')
+        f.write(f'Dataset: {DATA_PATH}\n')
+        f.write(f'Eligibility: radiologists with >= {MIN_RADAI_CASES} RADAI impressions\n')
+        f.write('Rows included: RADAI rows only (n_inferences >= 1), non-blank omni_impression\n')
+        f.write('Unique-pair rule: only rows where (omni_impression, impression) pair frequency == 1\n')
+        f.write(f'Pre period : collected_timestamp <= {PRE_CUTOFF.date()}\n')
+        f.write(f'Post period: collected_timestamp >= {POST_START.date()}\n')
+        f.write(f'BERTScore model: {MODEL_TYPE}\n')
+        f.write(f'BERTScore num_layers: {NUM_LAYERS}\n')
+        f.write(f'Rescale with baseline: {RESCALE_WITH_BASELINE}\n')
+        f.write(f'Sharding: num_shards={NUM_SHARDS}, shard_index={SHARD_INDEX}\n\n')
+        f.write('Blank final impressions are treated as no-edit cases (precision=recall=F1=1.0).\n\n')
+
+        f.write(f'Total rows loaded: {total_rows_raw:,}\n')
+        f.write(f'Rows after cohort/period/text filtering before unique-pair filter: {len(df):,}\n')
+        f.write(f'Rows retained after unique-pair filter: {len(df_unique):,}\n\n')
+
+        f.write('BY PERIOD\n')
+        f.write('-' * 100 + '\n')
+        if period_df.empty:
+            f.write('No rows available.\n')
+        else:
+            for _, r in period_df.iterrows():
+                f.write(
+                    f"{r['period']}: n={int(r['n_rows'])}, "
+                    f"bert_f1_median={r['bert_f1_median']:.4f}, "
+                    f"bert_precision_median={r['bert_precision_median']:.4f}, "
+                    f"bert_recall_median={r['bert_recall_median']:.4f}\n"
+                )
+
+        f.write('\nBY PERIOD + MODALITY\n')
+        f.write('-' * 100 + '\n')
+        if period_mod_df.empty:
+            f.write('No rows available.\n')
+        else:
+            for _, r in period_mod_df.iterrows():
+                f.write(
+                    f"{r['period']} | {r['modality']}: n={int(r['n_rows'])}, "
+                    f"bert_f1_median={r['bert_f1_median']:.4f}, "
+                    f"bert_precision_median={r['bert_precision_median']:.4f}, "
+                    f"bert_recall_median={r['bert_recall_median']:.4f}\n"
+                )
+
+        f.write('\nBY PERIOD + MODALITY + ANATOMIC REGION\n')
+        f.write('-' * 100 + '\n')
+        if period_mod_reg_df.empty:
+            f.write('No rows available.\n')
+        else:
+            for _, r in period_mod_reg_df.iterrows():
+                f.write(
+                    f"{r['period']} | {r['modality']} | {r['anatomic_region']}: n={int(r['n_rows'])}, "
+                    f"bert_f1_median={r['bert_f1_median']:.4f}, "
+                    f"bert_precision_median={r['bert_precision_median']:.4f}, "
+                    f"bert_recall_median={r['bert_recall_median']:.4f}\n"
+                )
+
+        f.write('\nKRUSKAL-WALLIS: BERT F1 ACROSS MODALITIES WITHIN EACH PERIOD\n')
+        f.write('-' * 100 + '\n')
+        if kw_period_mod_df.empty:
+            f.write('No testable groups available.\n')
+        else:
+            for _, r in kw_period_mod_df.iterrows():
+                if pd.isna(r['kw_p']):
+                    f.write(
+                        f"{r['period']}: insufficient groups "
+                        f"(modalities_tested={int(r['n_modalities_tested'])})\n"
+                    )
+                else:
+                    f.write(
+                        f"{r['period']}: H={r['kw_h']:.4f}, p={r['kw_p']:.4e}, "
+                        f"significant={bool(r['kw_significant_p_lt_0_05'])}, "
+                        f"n_modalities={int(r['n_modalities_tested'])}, "
+                        f"n_rows={int(r['n_rows_tested'])}\n"
+                    )
+
+        f.write('\nKRUSKAL-WALLIS: BERT F1 ACROSS ANATOMIC REGIONS WITHIN EACH PERIOD/MODALITY\n')
+        f.write('-' * 100 + '\n')
+        if kw_period_mod_reg_df.empty:
+            f.write('No testable groups available.\n')
+        else:
+            for _, r in kw_period_mod_reg_df.iterrows():
+                if pd.isna(r['kw_p']):
+                    f.write(
+                        f"{r['period']} | {r['modality']}: insufficient groups "
+                        f"(regions_tested={int(r['n_regions_tested'])})\n"
+                    )
+                else:
+                    f.write(
+                        f"{r['period']} | {r['modality']}: "
+                        f"H={r['kw_h']:.4f}, p={r['kw_p']:.4e}, "
+                        f"significant={bool(r['kw_significant_p_lt_0_05'])}, "
+                        f"n_regions={int(r['n_regions_tested'])}, "
+                        f"n_rows={int(r['n_rows_tested'])}\n"
+                    )
+
+    print('Saved:')
+    print(f'  {OUT_USED_ROWS}')
+    print(f'  {OUT_PERIOD}')
+    print(f'  {OUT_PERIOD_MODALITY}')
+    print(f'  {OUT_PERIOD_MODALITY_REGION}')
+    print(f'  {OUT_KW_PERIOD_MODALITY}')
+    print(f'  {OUT_KW_PERIOD_MODALITY_REGION}')
+    print(f'  {OUT_RESULTS}')
+
+
+if __name__ == '__main__':
+    main()
