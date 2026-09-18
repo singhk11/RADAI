@@ -1,0 +1,681 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+import argparse
+import requests
+import json
+import time
+from collections import defaultdict
+from tqdm import tqdm
+import warnings
+import pickle
+import os
+warnings.filterwarnings('ignore')
+
+# Try to import Levenshtein (optimized version if available)
+try:
+    from Levenshtein import distance as levenshtein_distance
+except ImportError:
+    print("Warning: Optimized Levenshtein not available, using fallback")
+    def levenshtein_distance(s1, s2):
+        """Fallback implementation if python-Levenshtein not installed."""
+        if len(s1) < len(s2):
+            return levenshtein_distance(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        return previous_row[-1]
+
+
+# UMLS API Configuration (INSERT YOUR API KEY HERE)
+UMLS_API_KEY = 'cc494c0c-9afd-440a-9646-683029a98479'  
+UMLS_BASE_URL = 'https://uts-ws.nlm.nih.gov/rest'
+
+# Data paths
+DATA_PATH = '/data/aiiih/projects/singhk/radai/Data/CCF_dataset_wmetadata.csv'
+EDIT_DISTANCE_MODALITY_PATH = '/data/aiiih/projects/singhk/radai/Output/edit_distance_by_modality.csv'
+EDIT_DISTANCE_BODYPART_PATH = '/data/aiiih/projects/singhk/radai/Output/edit_distance_by_bodypart.csv'
+OUTPUT_DIR = '/data/aiiih/projects/singhk/radai/Output'
+
+# Analysis parameters
+SAMPLE_SIZE = 537584  # Sample size for UMLS concept extraction (API rate limits)
+RANDOM_STATE = 42
+MAX_PHRASES_PER_IMPRESSION = 5
+API_SLEEP_SECONDS = 0.02
+CHECKPOINT_INTERVAL = 500  # Save progress every N impressions
+CONCEPT_SAMPLE_CACHE_PATH = f'{OUTPUT_DIR}/concept_density_sample_analysis.csv'
+
+# Global cache for UMLS API responses
+_umls_cache = {}
+_cache_file = '/data/aiiih/projects/singhk/radai/Output/umls_concept_cache.pkl'
+_checkpoint_file = '/data/aiiih/projects/singhk/radai/Output/umls_concept_map_checkpoint.pkl'
+
+def load_umls_cache():
+    
+    global _umls_cache
+    if os.path.exists(_cache_file):
+        try:
+            with open(_cache_file, 'rb') as f:
+                _umls_cache = pickle.load(f)
+            print(f"  Loaded {len(_umls_cache):,} cached UMLS API responses")
+        except:
+            _umls_cache = {}
+    return _umls_cache
+
+def save_umls_cache():
+    try:
+        with open(_cache_file, 'wb') as f:
+            pickle.dump(_umls_cache, f)
+    except:
+        pass
+
+def get_umls_concepts(text, api_key=UMLS_API_KEY, timeout=10, use_cache=True):
+
+    global _umls_cache
+    
+    if not text or pd.isna(text):
+        return []
+    
+    text_key = str(text)[:200]  # Use truncated text as cache key
+    
+    # Check cache first
+    if use_cache and text_key in _umls_cache:
+        return _umls_cache[text_key]
+    
+    try:
+        # Extract all words/phrases - break into chunks for better matching
+        phrases = set()
+        words = str(text).lower().split()
+        
+        # Add individual words and multi-word phrases
+        for i, word in enumerate(words):
+            if len(word) > 3:  # Skip very short words
+                phrases.add(word.strip('.,!?;:'))
+            if i < len(words) - 1:
+                phrase = f"{words[i]} {words[i+1]}"
+                if len(phrase) > 5:
+                    phrases.add(phrase)
+        
+        concepts = []
+        
+        # Query each phrase against UMLS
+        for phrase in list(phrases)[:MAX_PHRASES_PER_IMPRESSION]:
+            if not phrase or len(phrase) < 2:
+                continue
+            
+            try:
+                # Use UMLS search endpoint with best match strategy
+                params = {
+                    'string': phrase,
+                    'searchType': 'rightTrunc',  # Prefix matching for flexibility
+                    'apikey': api_key,
+                    'pageSize': 5  # Get top 5 results
+                }
+                
+                response = requests.get(
+                    f'{UMLS_BASE_URL}/search/current',
+                    params=params,
+                    timeout=timeout
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if 'result' in data and 'results' in data['result']:
+                        for result in data['result']['results'][:3]:  # Take top 3 matches
+                            concept = {
+                                'cui': result.get('ui'),
+                                'term': result.get('name'),
+                                'sem_types': result.get('semanticTypes', []),
+                                'score': result.get('score', 0)
+                            }
+                            # Avoid duplicates
+                            if concept not in concepts:
+                                concepts.append(concept)
+                
+                time.sleep(API_SLEEP_SECONDS)
+                
+            except requests.exceptions.Timeout:
+                pass  # Skip this phrase on timeout
+            except Exception as e:
+                pass  # Skip problematic phrases
+        
+        # Cache the result
+        _umls_cache[text_key] = concepts
+        
+        return concepts
+        
+    except Exception as e:
+        print(f"  Warning: Error querying UMLS API: {e}")
+        return []
+
+
+def extract_concept_candidates(text, use_umls_api=True, api_key=UMLS_API_KEY):
+
+    if not text or pd.isna(text):
+        return []
+    
+    # Try UMLS API first
+    if use_umls_api:
+        api_concepts = get_umls_concepts(text, api_key)
+        if api_concepts:
+            return api_concepts
+    
+    # Fallback to heuristic extraction if API unavailable
+    text_lower = str(text).lower()
+    
+    # Comprehensive medical keywords from medical literature
+    medical_keywords = {
+        # Anatomical structures (expanded)
+        'brain': 'anatomy', 'cerebrum': 'anatomy', 'cerebellum': 'anatomy', 'brainstem': 'anatomy',
+        'ventricle': 'anatomy', 'lobe': 'anatomy', 'cortex': 'anatomy', 'white matter': 'anatomy',
+        'spine': 'anatomy', 'vertebra': 'anatomy', 'disc': 'anatomy', 'cord': 'anatomy',
+        'chest': 'anatomy', 'lung': 'anatomy', 'heart': 'anatomy', 'mediastinum': 'anatomy',
+        'abdomen': 'anatomy', 'liver': 'anatomy', 'kidney': 'anatomy', 'pancreas': 'anatomy',
+        'pelvis': 'anatomy', 'bone': 'anatomy', 'muscle': 'anatomy', 'tendon': 'anatomy',
+        'joint': 'anatomy', 'artery': 'anatomy', 'vein': 'anatomy', 'capillary': 'anatomy',
+        'nerve': 'anatomy', 'soft tissue': 'anatomy', 'cartilage': 'anatomy', 'ligament': 'anatomy',
+        'stomach': 'anatomy', 'bowel': 'anatomy', 'colon': 'anatomy', 'esophagus': 'anatomy',
+        'thyroid': 'anatomy', 'thymus': 'anatomy', 'spleen': 'anatomy', 'bladder': 'anatomy',
+        
+        # Pathological findings (expanded)
+        'fracture': 'pathology', 'lesion': 'pathology', 'mass': 'pathology', 'tumor': 'pathology',
+        'hemorrhage': 'pathology', 'bleeding': 'pathology', 'hematoma': 'pathology', 'hemothorax': 'pathology',
+        'edema': 'pathology', 'infarct': 'pathology', 'infarction': 'pathology', 'ischemia': 'pathology',
+        'stenosis': 'pathology', 'occlusion': 'pathology', 'thrombus': 'pathology', 'thrombosis': 'pathology',
+        'aneurysm': 'pathology', 'dissection': 'pathology', 'degeneration': 'pathology', 'necrosis': 'pathology',
+        'arthritis': 'pathology', 'infection': 'pathology', 'abscess': 'pathology', 'pneumonia': 'pathology',
+        'consolidation': 'pathology', 'opacity': 'pathology', 'nodule': 'pathology', 'cyst': 'pathology',
+        'calcification': 'pathology', 'fibrosis': 'pathology', 'scarring': 'pathology', 'steatosis': 'pathology',
+        'carcinoma': 'pathology', 'adenoma': 'pathology', 'polyp': 'pathology', 'ulcer': 'pathology',
+        'dilatation': 'pathology', 'atelectasis': 'pathology', 'pleural effusion': 'pathology',
+        
+        # Procedures (expanded)
+        'ct': 'procedure', 'mri': 'procedure', 'ultrasound': 'procedure', 'radiograph': 'procedure',
+        'xray': 'procedure', 'scan': 'procedure', 'imaging': 'procedure', 'contrast': 'procedure',
+        'injection': 'procedure', 'biopsy': 'procedure', 'aspiration': 'procedure', 'ablation': 'procedure',
+        'fluoroscopy': 'procedure', 'angiography': 'procedure', 'mammography': 'procedure', 'pet': 'procedure',
+        
+        # Clinical descriptors (expanded)
+        'acute': 'descriptor', 'chronic': 'descriptor', 'new': 'descriptor', 'old': 'descriptor',
+        'enlargement': 'descriptor', 'atrophy': 'descriptor', 'hypertrophy': 'descriptor', 'hyperplasia': 'descriptor',
+        'displacement': 'descriptor', 'compression': 'descriptor', 'invasion': 'descriptor', 'infiltration': 'descriptor',
+        'normal': 'descriptor', 'abnormal': 'descriptor', 'prominent': 'descriptor', 'prominent': 'descriptor',
+        'stable': 'descriptor', 'progressive': 'descriptor', 'regressive': 'descriptor', 'subtle': 'descriptor',
+    }
+    
+    found_terms = []
+    for keyword, category in medical_keywords.items():
+        if keyword in text_lower:
+            found_terms.append({'term': keyword, 'category': category})
+    
+    return found_terms
+
+
+def calculate_concept_density(impression_text, concepts):
+
+    if not impression_text or pd.isna(impression_text):
+        return 0.0
+    
+    word_count = len(str(impression_text).split())
+    if word_count == 0:
+        return 0.0
+    
+    return len(concepts) / word_count
+
+
+def clean_impression_field(val):
+    """Normalize blank/NA/NAN impressions to empty string."""
+    if pd.isna(val):
+        return ''
+    s = str(val).strip()
+    if s.lower() in ['nan', 'na']:
+        return ''
+    return s
+
+
+def compute_edit_distance_with_blank_zero(omni_text, impression_text):
+    """Treat blank/NA final impression with populated omni as zero-edit."""
+    if pd.isna(omni_text):
+        return np.nan
+    s1 = str(omni_text).strip()
+    s2 = '' if pd.isna(impression_text) else str(impression_text).strip()
+    if s2 == '':
+        return 0
+    if s1 == '':
+        return np.nan
+    return levenshtein_distance(s1, s2)
+
+
+def compute_normalized_edit_distance_with_blank_zero(omni_text, impression_text):
+    """Character-normalized edit distance with blank final impression treated as zero-edit."""
+    dist = compute_edit_distance_with_blank_zero(omni_text, impression_text)
+    if pd.isna(dist):
+        return np.nan
+    s1 = '' if pd.isna(omni_text) else str(omni_text).strip()
+    s2 = '' if pd.isna(impression_text) else str(impression_text).strip()
+    if s2 == '':
+        return 0.0
+    max_len = max(len(s1), len(s2))
+    return dist / max_len if max_len > 0 else 0.0
+
+
+def build_or_update_concept_map(unique_impressions):
+    """Build concept map with checkpoint resume support."""
+    concept_map = {}
+    if os.path.exists(_checkpoint_file):
+        try:
+            with open(_checkpoint_file, 'rb') as f:
+                concept_map = pickle.load(f)
+            print(f"  Resuming from checkpoint: {len(concept_map):,} impressions already processed")
+        except Exception as e:
+            print(f"  Warning: Could not load checkpoint ({e}), starting fresh")
+            concept_map = {}
+
+    remaining = [x for x in unique_impressions if x not in concept_map]
+    print(f"  Remaining to process: {len(remaining):,}")
+
+    for i, text in enumerate(tqdm(remaining, desc='UMLS extraction')):
+        concept_map[text] = extract_concept_candidates(text, use_umls_api=True, api_key=UMLS_API_KEY)
+        if (i + 1) % CHECKPOINT_INTERVAL == 0:
+            try:
+                with open(_checkpoint_file, 'wb') as f:
+                    pickle.dump(concept_map, f)
+                save_umls_cache()
+            except Exception as e:
+                print(f"  Warning: checkpoint save failed: {e}")
+
+    try:
+        with open(_checkpoint_file, 'wb') as f:
+            pickle.dump(concept_map, f)
+    except Exception as e:
+        print(f"  Warning: final checkpoint save failed: {e}")
+    save_umls_cache()
+
+    print(f"  ✓ Cache saved with {len(_umls_cache):,} unique phrase queries")
+    print(f"  ✓ Checkpoint saved with {len(concept_map):,} processed impressions")
+    return concept_map
+
+
+def main():
+    parser = argparse.ArgumentParser(description='UMLS concept density analysis with optional correlation refresh mode.')
+    parser.add_argument(
+        '--refresh-correlations-only',
+        action='store_true',
+        help='Reuse cached concept density from concept_density_sample_analysis.csv and only recompute edit distances/correlations.'
+    )
+    parser.add_argument(
+        '--force-recompute-concepts',
+        action='store_true',
+        help='Force full concept extraction even if cached concept density sample exists.'
+    )
+    args = parser.parse_args()
+
+    print("\n" + "="*80)
+    print("UMLS CONCEPT DENSITY ANALYSIS")
+    print("="*80)
+    
+    # Load or initialize UMLS cache
+    print("\n[0/8] Initializing UMLS cache...")
+    load_umls_cache()
+    
+    # Load data
+    print("\n[1/8] Loading impression data...")
+    df = pd.read_csv(DATA_PATH)
+    df_radai = df[(df['n_inferences'].notna()) & (df['n_inferences'] >= 1)].copy()
+    df_both = df_radai[df_radai['omni_impression'].notna()].copy()
+    df_both['omni_impression_clean'] = df_both['omni_impression'].astype(str).str.strip()
+    df_both['impression_clean'] = df_both['impression'].apply(clean_impression_field)
+    df_both = df_both[df_both['omni_impression_clean'] != ''].copy()
+    
+    print(f"  Total RADAI impressions: {len(df_radai):,}")
+    print(f"  With populated omni_impression: {len(df_both):,}")
+    print(f"  Using sample for UMLS analysis: {min(SAMPLE_SIZE, len(df_both)):,}")
+    
+    # Sample for API efficiency
+    if len(df_both) > SAMPLE_SIZE:
+        df_analyze = df_both.sample(n=SAMPLE_SIZE, random_state=RANDOM_STATE).copy()
+    else:
+        df_analyze = df_both.copy()
+    
+    concept_cache_available = os.path.exists(CONCEPT_SAMPLE_CACHE_PATH)
+    reuse_cached_concepts = (args.refresh_correlations_only or concept_cache_available) and not args.force_recompute_concepts
+
+    if reuse_cached_concepts:
+        print(f"\n[2/8] Reusing cached concept density data...")
+        if concept_cache_available:
+            print(f"  Loading: {CONCEPT_SAMPLE_CACHE_PATH}")
+            df_cached = pd.read_csv(CONCEPT_SAMPLE_CACHE_PATH)
+            needed_cols = ['impression', 'n_concepts', 'word_count', 'concept_density']
+            missing_cols = [c for c in needed_cols if c not in df_cached.columns]
+            if missing_cols:
+                print(f"  Cached file missing columns {missing_cols}; falling back to full extraction")
+                reuse_cached_concepts = False
+            else:
+                concept_lookup = (
+                    df_cached[needed_cols]
+                    .dropna(subset=['impression'])
+                    .drop_duplicates(subset=['impression'])
+                    .rename(columns={'impression': 'impression_clean'})
+                )
+                df_analyze = df_analyze.merge(concept_lookup, on='impression_clean', how='left')
+                missing_concept_rows = df_analyze['concept_density'].isna().sum()
+                print(f"  Reused concept density for {len(df_analyze) - missing_concept_rows:,} / {len(df_analyze):,} rows")
+                
+                # If --refresh-correlations-only, filter to only cached rows and skip UMLS extraction
+                if args.refresh_correlations_only:
+                    if missing_concept_rows > 0:
+                        print(f"  Filtering to cached rows only (--refresh-correlations-only flag set)")
+                        print(f"  Removing {missing_concept_rows:,} rows without cached concept density")
+                        df_analyze = df_analyze[df_analyze['concept_density'].notna()].copy()
+                        print(f"  Continuing with {len(df_analyze):,} rows with cached concepts")
+                    df_analyze['concepts'] = np.nan
+                elif missing_concept_rows > 0:
+                    # Only extract missing concepts if NOT explicitly doing --refresh-correlations-only
+                    print(f"  Missing cached concept density in {missing_concept_rows:,} rows; extracting only missing impressions")
+                    unique_missing = list(df_analyze[df_analyze['concept_density'].isna()]['impression_clean'].astype(str).unique())
+                    concept_map = build_or_update_concept_map(unique_missing)
+                    df_missing = df_analyze['concept_density'].isna()
+                    df_analyze.loc[df_missing, 'concepts'] = df_analyze.loc[df_missing, 'impression_clean'].astype(str).map(concept_map)
+                    df_analyze.loc[df_missing, 'n_concepts'] = df_analyze.loc[df_missing, 'concepts'].apply(len)
+                    df_analyze.loc[df_missing, 'word_count'] = df_analyze.loc[df_missing, 'impression_clean'].astype(str).str.split().str.len()
+                    df_analyze.loc[df_missing, 'concept_density'] = df_analyze.loc[df_missing].apply(
+                        lambda row: calculate_concept_density(row['impression_clean'], row['concepts']),
+                        axis=1
+                    )
+                else:
+                    df_analyze['concepts'] = np.nan
+
+    if not reuse_cached_concepts:
+        # Extract concepts from impressions using UMLS API with fallback
+        print(f"\n[2/8] Extracting medical concepts (using UMLS API + heuristic fallback)...")
+        print(f"  Processing {len(df_analyze):,} impressions...")
+        print(f"  Note: UMLS API queries are cached and rate-limited ({API_SLEEP_SECONDS:.2f}s per request)")
+
+        unique_impressions = list(df_analyze['impression_clean'].astype(str).unique())
+        print(f"  Unique impressions to query: {len(unique_impressions):,} (from {len(df_analyze):,} rows)")
+
+        concept_map = build_or_update_concept_map(unique_impressions)
+
+        df_analyze['concepts'] = df_analyze['impression_clean'].astype(str).map(concept_map)
+        df_analyze['n_concepts'] = df_analyze['concepts'].apply(len)
+
+        print(f"\n[3/8] Concept extraction complete")
+        print(f"  Concepts extracted successfully")
+        print(f"  Mean concepts per impression: {df_analyze['n_concepts'].mean():.2f}")
+        print(f"  Median concepts per impression: {df_analyze['n_concepts'].median():.2f}")
+        print(f"  Std: {df_analyze['n_concepts'].std():.2f}")
+
+        # Calculate concept density
+        print(f"\n[4/8] Calculating concept density...")
+        df_analyze['concept_density'] = df_analyze.apply(
+            lambda row: calculate_concept_density(row['impression_clean'], row['concepts']),
+            axis=1
+        )
+
+        # Calculate word count
+        df_analyze['word_count'] = df_analyze['impression_clean'].astype(str).str.split().str.len()
+    
+    print(f"  Mean concept density: {df_analyze['concept_density'].mean():.4f} concepts/word")
+    print(f"  Median concept density: {df_analyze['concept_density'].median():.4f}")
+    print(f"  Std: {df_analyze['concept_density'].std():.4f}")
+    
+    # Calculate edit distances for the analyzed sample
+    print(f"\n[5/8] Calculating edit distances for analyzed sample...")
+
+    # Calculate edit distance for the sample
+    df_analyze['edit_distance'] = df_analyze.apply(
+        lambda row: compute_edit_distance_with_blank_zero(row['omni_impression'], row['impression_clean']),
+        axis=1
+    )
+    
+    # Calculate normalized edit distance
+    df_analyze['normalized_edit_distance'] = df_analyze.apply(
+        lambda row: compute_normalized_edit_distance_with_blank_zero(row['omni_impression'], row['impression_clean']),
+        axis=1
+    )
+    
+    # Load modality-level statistics for context
+    df_edit = pd.read_csv(EDIT_DISTANCE_MODALITY_PATH)
+    
+    # Map the pre-calculated modality statistics to each row
+    modality_edit_dict = df_edit.set_index('Modality')[
+        ['edit_dist_mean', 'norm_edit_mean', 'word_norm_edit_mean']
+    ].to_dict('index')
+    
+    # Add modality-level metrics to analyzed data
+    df_analyze['modality_edit_dist_mean'] = df_analyze['modality_server'].map(
+        lambda m: modality_edit_dict.get(m, {}).get('edit_dist_mean', np.nan)
+    )
+    df_analyze['modality_word_norm_edit_mean'] = df_analyze['modality_server'].map(
+        lambda m: modality_edit_dict.get(m, {}).get('word_norm_edit_mean', np.nan)
+    )
+    
+    # Calculate concept complexity relative to modality mean
+    df_analyze['concept_density_zscore'] = df_analyze.groupby('modality_server')[
+        'concept_density'
+    ].transform(lambda x: (x - x.mean()) / x.std() if x.std() > 0 else 0)
+    
+    print(f"  Edit distances calculated for sample")
+    
+    # Correlation analysis by modality
+    print(f"\n[6/8] Correlation analysis by modality...")
+    print(f"  {'Modality':<12} {'n':<8} {'Concept Density':<20} {'Edit Distance Mean':<20} {'Correlation':<15} {'p-value':<12}")
+    print(f"  {'-'*100}")
+    
+    correlation_results = []
+    
+    for modality in df_analyze['modality_server'].unique():
+        if pd.isna(modality):
+            continue
+        
+        df_mod = df_analyze[df_analyze['modality_server'] == modality]
+        
+        if len(df_mod) < 3:
+            continue
+        
+        # Correlation between concept density and edit distance
+        cors, pval = stats.spearmanr(
+            df_mod['concept_density'].dropna(),
+            df_mod['edit_distance'].dropna()
+        )
+        
+        print(f"  {modality:<12} {len(df_mod):<8} {df_mod['concept_density'].mean():<20.4f} {df_mod['edit_distance'].mean():<20.2f} {cors:<15.4f} {pval:<12.4e}")
+        
+        correlation_results.append({
+            'Modality': modality,
+            'n': len(df_mod),
+            'concept_density_mean': df_mod['concept_density'].mean(),
+            'concept_density_std': df_mod['concept_density'].std(),
+            'edit_distance_mean': df_mod['edit_distance'].mean(),
+            'edit_distance_std': df_mod['edit_distance'].std(),
+            'word_count_mean': df_mod['word_count'].mean(),
+            'correlation': cors,
+            'p_value': pval,
+            'significant': 'Yes' if pval < 0.05 else 'No'
+        })
+    
+    df_correlation = pd.DataFrame(correlation_results)
+    
+    # Overall correlation
+    cors_all, pval_all = stats.spearmanr(
+        df_analyze['concept_density'].dropna(),
+        df_analyze['edit_distance'].dropna()
+    )
+    print(f"\n  OVERALL CORRELATION:")
+    print(f"  Spearman r = {cors_all:.4f}, p = {pval_all:.4e}")
+    
+    # Visualizations
+    print(f"\n[7/8] Generating visualizations...")
+
+    # ── Figure 1: Per-modality scatter plots (concept density vs edit distance) ──
+    modalities_plot = [r['Modality'] for _, r in df_correlation.iterrows()
+                       if pd.notna(r['Modality']) and r['n'] >= 5]
+    n_mods = len(modalities_plot)
+    ncols = min(3, n_mods)
+    nrows = int(np.ceil(n_mods / ncols))
+
+    cmap = plt.get_cmap('tab10')
+    mod_color = {m: cmap(i % 10) for i, m in enumerate(modalities_plot)}
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 6 * nrows), squeeze=False)
+    fig.suptitle('Concept Density vs Edit Distance — Per Modality', fontsize=16, fontweight='bold', y=1.01)
+
+    for idx, modality in enumerate(modalities_plot):
+        ax = axes[idx // ncols][idx % ncols]
+        mod_data = df_analyze[df_analyze['modality_server'] == modality].dropna(
+            subset=['concept_density', 'edit_distance'])
+        mod_data = mod_data[np.isfinite(mod_data['concept_density']) & np.isfinite(mod_data['edit_distance'])]
+
+        cor_row = df_correlation[df_correlation['Modality'] == modality].iloc[0]
+        r_val   = cor_row['correlation']
+        p_val   = cor_row['p_value']
+        n_val   = len(mod_data)
+
+        # Scatter
+        ax.scatter(mod_data['concept_density'], mod_data['edit_distance'],
+                   alpha=0.25, s=15, color=mod_color[modality], edgecolors='none')
+
+        # Regression line
+        if n_val >= 3:
+            m_fit, b_fit = np.polyfit(mod_data['concept_density'], mod_data['edit_distance'], 1)
+            x_line = np.linspace(mod_data['concept_density'].min(), mod_data['concept_density'].max(), 200)
+            ax.plot(x_line, m_fit * x_line + b_fit, color='black', linewidth=1.5, linestyle='--')
+
+        sig_str = '***' if p_val < 0.001 else ('**' if p_val < 0.01 else ('*' if p_val < 0.05 else 'ns'))
+        ax.set_title(f'{modality}  (n={n_val:,})\nSpearman r={r_val:.3f}, p={p_val:.2e} {sig_str}',
+                     fontsize=11, fontweight='bold')
+        ax.set_xlabel('Concept Density (concepts/word)', fontsize=10)
+        ax.set_ylabel('Edit Distance (characters)', fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+    # Hide unused subplots
+    for spare in range(n_mods, nrows * ncols):
+        axes[spare // ncols][spare % ncols].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(f'{OUTPUT_DIR}/concept_density_scatter_by_modality.png', dpi=150, bbox_inches='tight')
+    print(f"  ✓ Saved: {OUTPUT_DIR}/concept_density_scatter_by_modality.png")
+    plt.close(fig)
+
+    # ── Figure 2: Concept density distributions (histogram + per-modality boxplot) ──
+    fig2, axes2 = plt.subplots(1, 2, figsize=(16, 6))
+    fig2.suptitle('Concept Density Distributions', fontsize=14, fontweight='bold')
+
+    # Histogram — overall
+    ax = axes2[0]
+    cd_vals = df_analyze['concept_density'].dropna()
+    cd_vals = cd_vals[np.isfinite(cd_vals)]
+    ax.hist(cd_vals, bins=60, edgecolor='none', alpha=0.75, color='steelblue')
+    ax.axvline(cd_vals.mean(),   color='red',    linestyle='--', label=f"Mean: {cd_vals.mean():.4f}")
+    ax.axvline(cd_vals.median(), color='orange', linestyle='--', label=f"Median: {cd_vals.median():.4f}")
+    ax.set_xlabel('Concept Density (concepts/word)', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.set_title('Overall Distribution of Concept Density', fontsize=13, fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Boxplot — by modality
+    ax = axes2[1]
+    modalities_sorted = df_correlation.sort_values('concept_density_mean', ascending=False)['Modality'].tolist()
+    plot_data  = [df_analyze[df_analyze['modality_server'] == m]['concept_density']
+                              .dropna().pipe(lambda s: s[np.isfinite(s)]).values
+                  for m in modalities_sorted if m in df_analyze['modality_server'].values]
+    mod_labels = [m for m in modalities_sorted if m in df_analyze['modality_server'].values]
+    bp = ax.boxplot(plot_data, labels=mod_labels, patch_artist=True, showfliers=False)
+    for patch, lbl in zip(bp['boxes'], mod_labels):
+        patch.set_facecolor(mod_color.get(lbl, 'lightblue'))
+        patch.set_alpha(0.7)
+    ax.set_ylabel('Concept Density (concepts/word)', fontsize=12)
+    ax.set_title('Concept Density by Modality', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    fig2.tight_layout()
+    fig2.savefig(f'{OUTPUT_DIR}/concept_density_distributions.png', dpi=150, bbox_inches='tight')
+    print(f"  ✓ Saved: {OUTPUT_DIR}/concept_density_distributions.png")
+    plt.close(fig2)
+    
+    # Save results
+    print(f"\n[8/8] Saving results...")
+    df_correlation.to_csv(f'{OUTPUT_DIR}/concept_density_by_modality.csv', index=False)
+    print(f"  ✓ Saved: {OUTPUT_DIR}/concept_density_by_modality.csv")
+    
+    # Save detailed sample data
+    df_sample_output = df_analyze[[
+        'modality_server', 'impression_clean', 'n_concepts', 'word_count', 
+        'concept_density', 'edit_distance', 'normalized_edit_distance'
+    ]].copy().rename(columns={'impression_clean': 'impression'})
+    df_sample_output.to_csv(f'{OUTPUT_DIR}/concept_density_sample_analysis.csv', index=False)
+    print(f"  ✓ Saved: {OUTPUT_DIR}/concept_density_sample_analysis.csv")
+    
+    # Summary report
+    summary = f"""
+UMLS CONCEPT DENSITY ANALYSIS SUMMARY
+=====================================
+
+Analysis Date: March 18, 2026
+Sample Size: {len(df_analyze):,} RADAI impressions (sampled from {len(df_both):,})
+Method: UMLS API + heuristic fallback (cached queries at 0.1s per request)
+
+OVERALL STATISTICS
+------------------
+Total Concepts Extracted: {df_analyze['n_concepts'].sum():,}
+Mean Concepts per Impression: {df_analyze['n_concepts'].mean():.2f}
+Mean Concept Density: {df_analyze['concept_density'].mean():.4f} concepts/word
+Median Concept Density: {df_analyze['concept_density'].median():.4f}
+Std Dev: {df_analyze['concept_density'].std():.4f}
+
+CONCEPT DENSITY BY MODALITY
+---------------------------
+"""
+    
+    for _, row in df_correlation.iterrows():
+        summary += f"""
+{row['Modality']} (n={row['n']:,}):
+  Concept Density: {row['concept_density_mean']:.4f} ± {row['concept_density_std']:.4f}
+  Edit Distance: {row['edit_distance_mean']:.2f} ± {row['edit_distance_std']:.2f} characters
+  Correlation: r={row['correlation']:.4f}, p={row['p_value']:.4e} ({row['significant']})
+"""
+    
+    summary += f"""
+
+OVERALL CORRELATION
+-------------------
+Spearman r = {cors_all:.4f}
+p-value = {pval_all:.4e}
+Interpretation: {'Significant positive correlation' if cors_all > 0 and pval_all < 0.05 else 'No significant correlation'} between concept density and edit distance.
+
+Script: /data/aiiih/projects/singhk/radai/Analysis/umls_concept_density_analysis.py
+"""
+    
+    with open(f'{OUTPUT_DIR}/concept_density_summary.txt', 'w') as f:
+        f.write(summary)
+    
+    print(f"  ✓ Saved: {OUTPUT_DIR}/concept_density_summary.txt")
+    
+    print("\n" + "="*80)
+    print("ANALYSIS COMPLETE!")
+    print("="*80)
+    print(f"\nUMLS API Status: ACTIVE")
+    print(f"  - API Key configured (see line 54)")
+    print(f"  - Concepts cached to: /data/aiiih/projects/singhk/radai/Output/umls_concept_cache.pkl")
+    print(f"  - Checkpoint at:      /data/aiiih/projects/singhk/radai/Output/umls_concept_map_checkpoint.pkl")
+    print(f"  - Rate limiting: 0.1s per phrase (respects UMLS API limits)")
+    print(f"  - Fallback: Heuristic extraction if API unavailable")
+    print(f"\nTo update your UMLS API key:")
+    print(f"  Edit line 54: UMLS_API_KEY = 'your_key_here'")
+    print(f"  Get key from: https://uts.nlm.nih.gov/uts/")
+    print(f"\nAll results saved to: {OUTPUT_DIR}/")
+
+
+if __name__ == '__main__':
+    main()
