@@ -1,0 +1,219 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+DATA_PATH = '/data/aiiih/projects/singhk/radai/Data/CCF_dataset_wmetadata_v2.csv'
+OUTPUT_DIR = '/data/aiiih/projects/singhk/radai/Output'
+MIN_RADAI_CASES = 100
+
+PRE_CUTOFF = pd.Timestamp('2025-06-02')
+POST_START = pd.Timestamp('2025-07-01')
+
+ADDENDUM_REGEX = re.compile(r'(addended\s+report|addendum(?:\s*#\d+)?\s*:?)', re.IGNORECASE)
+
+OVERALL_CSV = f'{OUTPUT_DIR}/addendum_v2_kprov_by_period_overall.csv'
+MODALITY_CSV = f'{OUTPUT_DIR}/addendum_v2_kprov_by_period_modality.csv'
+PAIRED_CSV = f'{OUTPUT_DIR}/addendum_v2_kprov_by_period_paired_reports.csv'
+RESULTS_TXT = f'{OUTPUT_DIR}/addendum_v2_kprov_by_period_results.txt'
+
+
+def has_addendum(text):
+    if pd.isna(text):
+        return 0
+    return int(bool(ADDENDUM_REGEX.search(str(text))))
+
+
+def mcnemar_exact_pvalue(b, c):
+    n = b + c
+    if n == 0:
+        return np.nan
+    return stats.binomtest(min(b, c), n=n, p=0.5, alternative='two-sided').pvalue
+
+
+def contingency_from_pairs(df_pairs):
+    a = int(((df_pairs['pre_non_radai_addendum'] == 0) & (df_pairs['post_radai_addendum'] == 0)).sum())
+    b = int(((df_pairs['pre_non_radai_addendum'] == 0) & (df_pairs['post_radai_addendum'] == 1)).sum())
+    c = int(((df_pairs['pre_non_radai_addendum'] == 1) & (df_pairs['post_radai_addendum'] == 0)).sum())
+    d = int(((df_pairs['pre_non_radai_addendum'] == 1) & (df_pairs['post_radai_addendum'] == 1)).sum())
+    return a, b, c, d
+
+
+def build_pairs(df_sub, group_cols):
+    rows = []
+    for keys, g in df_sub.groupby(group_cols + ['k_prov_key'], dropna=True):
+        g_non = g[~g['is_radai']].sort_values('end_proc_dttm', kind='mergesort')
+        g_rad = g[g['is_radai']].sort_values('end_proc_dttm', kind='mergesort')
+        n_pairs = min(len(g_non), len(g_rad))
+        if n_pairs == 0:
+            continue
+
+        pre_vals = g_non['has_addendum'].to_numpy()[:n_pairs]
+        post_vals = g_rad['has_addendum'].to_numpy()[:n_pairs]
+
+        for i in range(n_pairs):
+            row = {
+                'k_prov_key': g['k_prov_key'].iloc[0],
+                'pair_index': i + 1,
+                'pre_non_radai_addendum': int(pre_vals[i]),
+                'post_radai_addendum': int(post_vals[i]),
+            }
+            if isinstance(keys, tuple):
+                for col, val in zip(group_cols + ['k_prov_key'], keys):
+                    if col != 'k_prov_key':
+                        row[col] = val
+            else:
+                row[group_cols[0]] = keys
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def summarize_pairs(df_pairs, group_cols):
+    out = []
+    if df_pairs.empty:
+        return pd.DataFrame(out)
+
+    for keys, g in df_pairs.groupby(group_cols, dropna=False):
+        a, b, c, d = contingency_from_pairs(g)
+        n = a + b + c + d
+        pre_rate = (c + d) / n if n > 0 else np.nan
+        post_rate = (b + d) / n if n > 0 else np.nan
+        p_exact = mcnemar_exact_pvalue(b, c)
+
+        row = {
+            'n_pairs': int(n),
+            'n_paired_providers': int(g['k_prov_key'].nunique()),
+            'a_pre0_post0': a,
+            'b_pre0_post1': b,
+            'c_pre1_post0': c,
+            'd_pre1_post1': d,
+            'pre_addendum_rate': pre_rate,
+            'post_addendum_rate': post_rate,
+            'delta_post_minus_pre': post_rate - pre_rate,
+            'mcnemar_exact_p': p_exact,
+            'significant': 'Yes' if pd.notna(p_exact) and p_exact < 0.05 else 'No',
+        }
+
+        if isinstance(keys, tuple):
+            for col, val in zip(group_cols, keys):
+                row[col] = val
+        else:
+            row[group_cols[0]] = keys
+
+        out.append(row)
+
+    return pd.DataFrame(out)
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    usecols = [
+        'k_pat_proc_img_key', 'accession', 'end_proc_dttm', 'k_prov_key',
+        'modality_cd', 'n_inferences', 'full_report_text'
+    ]
+    df = pd.read_csv(DATA_PATH, usecols=usecols, low_memory=False)
+    total_raw = len(df)
+
+    # Deduplicate to unique reports (v2-specific keys)
+    report_key = (
+        df['k_pat_proc_img_key']
+        .fillna(df['accession'])
+        .astype(str)
+        .str.strip()
+    )
+    report_key = report_key.replace({'': np.nan, 'nan': np.nan, 'None': np.nan, 'NA': np.nan})
+    miss = report_key.isna()
+    if miss.any():
+        report_key.loc[miss] = [f'__MISSING_KEY_ROW_{i}__' for i in np.arange(miss.sum())]
+    df['report_key'] = report_key
+
+    df['end_proc_dttm'] = pd.to_datetime(df['end_proc_dttm'], errors='coerce')
+    df = df.sort_values(['report_key', 'end_proc_dttm'])
+    df = df.drop_duplicates(subset=['report_key'], keep='last').copy()
+
+    # Pairing key: k_prov_key
+    df['k_prov_key'] = df['k_prov_key'].astype(str).str.strip()
+    df.loc[df['k_prov_key'].str.lower().isin(['', 'nan', 'na', 'none']), 'k_prov_key'] = np.nan
+    df = df[df['k_prov_key'].notna()].copy()
+
+    # Eligibility: >=100 RADAI impressions by k_prov_key (same threshold)
+    is_radai_all = pd.to_numeric(df['n_inferences'], errors='coerce').fillna(0).gt(0)
+    radai_counts = df.loc[is_radai_all].groupby('k_prov_key').size()
+    eligible = set(radai_counts[radai_counts >= MIN_RADAI_CASES].index)
+    df = df[df['k_prov_key'].isin(eligible)].copy()
+
+    # Period assignment
+    df = df[df['end_proc_dttm'].notna()].copy()
+    df['period'] = np.where(df['end_proc_dttm'] <= PRE_CUTOFF, 'pre', np.where(df['end_proc_dttm'] >= POST_START, 'post', 'gap'))
+    df = df[df['period'].isin(['pre', 'post'])].copy()
+
+    # Analysis fields
+    df['is_radai'] = pd.to_numeric(df['n_inferences'], errors='coerce').fillna(0).gt(0)
+    df['has_addendum'] = df['full_report_text'].apply(has_addendum).astype(int)
+    df['modality'] = df['modality_cd'].fillna('UNKNOWN').astype(str).str.strip()
+    df.loc[df['modality'].str.lower().isin(['', 'nan', 'none', 'na']), 'modality'] = 'UNKNOWN'
+
+    # Overall by period
+    pairs_overall = build_pairs(df, ['period'])
+    overall = summarize_pairs(pairs_overall, ['period'])
+
+    # By period + modality
+    pairs_mod = build_pairs(df, ['period', 'modality'])
+    mod = summarize_pairs(pairs_mod, ['period', 'modality'])
+    if not mod.empty:
+        mod = mod.sort_values(['period', 'mcnemar_exact_p', 'n_pairs'], ascending=[True, True, False], na_position='last')
+
+    # Save outputs
+    overall.to_csv(OVERALL_CSV, index=False)
+    mod.to_csv(MODALITY_CSV, index=False)
+    pairs_mod.to_csv(PAIRED_CSV, index=False)
+
+    with open(RESULTS_TXT, 'w') as f:
+        f.write('ADDENDUM ANALYSIS (MCNEMAR) STRATIFIED BY IMPLEMENTATION PERIOD\n')
+        f.write('=' * 80 + '\n')
+        f.write(f'Dataset: {DATA_PATH}\n')
+        f.write('Pairing key: k_prov_key\n')
+        f.write(f'Eligibility: providers with >= {MIN_RADAI_CASES} RADAI impressions\n')
+        f.write('Comparison within each stratum: non-RADAI (pre) vs RADAI (post) paired by provider\n')
+        f.write(f'Pre period : end_proc_dttm <= {PRE_CUTOFF.date()}\n')
+        f.write(f'Post period: end_proc_dttm >= {POST_START.date()}\n')
+        f.write(f'Total rows (raw): {total_raw:,}\n')
+        f.write(f'Total rows (unique reports): {len(df):,}\n\n')
+
+        f.write('OVERALL BY PERIOD\n')
+        f.write('-' * 80 + '\n')
+        if overall.empty:
+            f.write('No paired comparisons available.\n')
+        else:
+            for _, r in overall.iterrows():
+                f.write(
+                    f"{r['period']}: providers={int(r['n_paired_providers'])}, pairs={int(r['n_pairs'])}, "
+                    f"pre_rate={r['pre_addendum_rate']:.6%}, post_rate={r['post_addendum_rate']:.6%}, "
+                    f"delta={r['delta_post_minus_pre']:.6%}, exact_p={r['mcnemar_exact_p']:.8g}\n"
+                )
+
+        f.write('\nMODALITY-STRATIFIED WITHIN PERIOD\n')
+        f.write('-' * 80 + '\n')
+        if mod.empty:
+            f.write('No period+modality paired comparisons available.\n')
+        else:
+            for _, r in mod.iterrows():
+                f.write(
+                    f"{r['period']} | {r['modality']}: providers={int(r['n_paired_providers'])}, "
+                    f"pairs={int(r['n_pairs'])}, pre_rate={r['pre_addendum_rate']:.6%}, "
+                    f"post_rate={r['post_addendum_rate']:.6%}, delta={r['delta_post_minus_pre']:.6%}, "
+                    f"exact_p={r['mcnemar_exact_p']:.8g} ({r['significant']})\n"
+                )
+
+    print('Saved:')
+    print(f'  {OVERALL_CSV}')
+    print(f'  {MODALITY_CSV}')
+    print(f'  {PAIRED_CSV}')
+    print(f'  {RESULTS_TXT}')
+
+
+if __name__ == '__main__':
+    main()
