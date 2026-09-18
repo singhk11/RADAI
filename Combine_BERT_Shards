@@ -1,0 +1,249 @@
+import argparse
+import os
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+OUTPUT_DIR = '/data/aiiih/projects/singhk/radai/Output/BERT_Score_Analysis'
+
+
+def summarize(df, group_cols):
+    rows = []
+    for keys, g in df.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = {c: v for c, v in zip(group_cols, keys)}
+        row.update(
+            {
+                'n_rows': int(len(g)),
+                'bert_precision_mean': float(g['bert_precision'].mean()),
+                'bert_precision_median': float(g['bert_precision'].median()),
+                'bert_precision_std': float(g['bert_precision'].std()),
+                'bert_recall_mean': float(g['bert_recall'].mean()),
+                'bert_recall_median': float(g['bert_recall'].median()),
+                'bert_recall_std': float(g['bert_recall'].std()),
+                'bert_f1_mean': float(g['bert_f1'].mean()),
+                'bert_f1_median': float(g['bert_f1'].median()),
+                'bert_f1_std': float(g['bert_f1'].std()),
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def kruskal_modalities_within_period(df, min_group_n=5):
+    rows = []
+    for period, g_period in df.groupby('period', dropna=False):
+        modality_groups = []
+        modality_names = []
+        modality_ns = []
+
+        for modality, g_mod in g_period.groupby('modality', dropna=False):
+            vals = g_mod['bert_f1'].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if len(vals) >= min_group_n:
+                modality_groups.append(vals)
+                modality_names.append(str(modality))
+                modality_ns.append(int(len(vals)))
+
+        if len(modality_groups) >= 2:
+            h_stat, p_value = stats.kruskal(*modality_groups)
+            rows.append(
+                {
+                    'period': period,
+                    'n_modalities_tested': int(len(modality_groups)),
+                    'n_rows_tested': int(sum(modality_ns)),
+                    'modalities_tested': '|'.join(modality_names),
+                    'group_sizes': '|'.join(str(x) for x in modality_ns),
+                    'kw_h': float(h_stat),
+                    'kw_p': float(p_value),
+                    'kw_significant_p_lt_0_05': bool(p_value < 0.05),
+                }
+            )
+        else:
+            rows.append(
+                {
+                    'period': period,
+                    'n_modalities_tested': int(len(modality_groups)),
+                    'n_rows_tested': int(sum(modality_ns)),
+                    'modalities_tested': '|'.join(modality_names),
+                    'group_sizes': '|'.join(str(x) for x in modality_ns),
+                    'kw_h': np.nan,
+                    'kw_p': np.nan,
+                    'kw_significant_p_lt_0_05': False,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def kruskal_regions_within_period_modality(df, min_group_n=5):
+    rows = []
+    for (period, modality), g_pm in df.groupby(['period', 'modality'], dropna=False):
+        region_groups = []
+        region_names = []
+        region_ns = []
+
+        for region, g_reg in g_pm.groupby('anatomic_region', dropna=False):
+            vals = g_reg['bert_f1'].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if len(vals) >= min_group_n:
+                region_groups.append(vals)
+                region_names.append(str(region))
+                region_ns.append(int(len(vals)))
+
+        if len(region_groups) >= 2:
+            h_stat, p_value = stats.kruskal(*region_groups)
+            rows.append(
+                {
+                    'period': period,
+                    'modality': modality,
+                    'n_regions_tested': int(len(region_groups)),
+                    'n_rows_tested': int(sum(region_ns)),
+                    'regions_tested': '|'.join(region_names),
+                    'group_sizes': '|'.join(str(x) for x in region_ns),
+                    'kw_h': float(h_stat),
+                    'kw_p': float(p_value),
+                    'kw_significant_p_lt_0_05': bool(p_value < 0.05),
+                }
+            )
+        else:
+            rows.append(
+                {
+                    'period': period,
+                    'modality': modality,
+                    'n_regions_tested': int(len(region_groups)),
+                    'n_rows_tested': int(sum(region_ns)),
+                    'regions_tested': '|'.join(region_names),
+                    'group_sizes': '|'.join(str(x) for x in region_ns),
+                    'kw_h': np.nan,
+                    'kw_p': np.nan,
+                    'kw_significant_p_lt_0_05': False,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Combine sharded BERTScore outputs.')
+    parser.add_argument('--num-shards', type=int, required=True)
+    parser.add_argument('--model-type', default='yikuan8/Clinical-Longformer')
+    parser.add_argument('--output-dir', default=OUTPUT_DIR)
+    parser.add_argument('--base-combined-dir')
+    parser.add_argument('--extra-shard', action='append', default=[])
+    parser.add_argument('--allowlist-csv')
+    parser.add_argument('--combined-name')
+    args = parser.parse_args()
+
+    if args.num_shards < 1:
+        raise ValueError('--num-shards must be >= 1')
+
+    model_slug = args.model_type.replace('/', '_').replace('-', '_')
+    model_dir = os.path.join(args.output_dir, model_slug)
+    combined_name = args.combined_name or f'combined_{args.num_shards:03d}_shards'
+    combined_dir = os.path.join(model_dir, combined_name)
+    os.makedirs(combined_dir, exist_ok=True)
+
+    shard_dfs = []
+    found = []
+    if args.base_combined_dir:
+        used_rows = os.path.join(
+            args.base_combined_dir,
+            'bert_score_period_modality_region_unique_pairs_used.csv',
+        )
+        if not os.path.exists(used_rows):
+            raise FileNotFoundError(f'Base combined rows not found: {used_rows}')
+        shard_dfs.append(pd.read_csv(used_rows, low_memory=False))
+        found.append(f'base:{args.base_combined_dir}')
+    else:
+        for idx in range(args.num_shards):
+            shard_dir = os.path.join(model_dir, f'shard_{idx:03d}_of_{args.num_shards:03d}')
+            used_rows = os.path.join(shard_dir, 'bert_score_period_modality_region_unique_pairs_used.csv')
+            if os.path.exists(used_rows):
+                shard_dfs.append(pd.read_csv(used_rows, low_memory=False))
+                found.append(idx)
+
+    for extra_dir in args.extra_shard:
+        used_rows = os.path.join(
+            extra_dir,
+            'bert_score_period_modality_region_unique_pairs_used.csv',
+        )
+        if not os.path.exists(used_rows):
+            raise FileNotFoundError(f'Extra shard rows not found: {used_rows}')
+        shard_dfs.append(pd.read_csv(used_rows, low_memory=False))
+        found.append(f'extra:{extra_dir}')
+
+    if not shard_dfs:
+        raise FileNotFoundError('No shard output files found to combine.')
+
+    df_unique = pd.concat(shard_dfs, ignore_index=True)
+    if args.allowlist_csv:
+        allowlist = pd.read_csv(
+            args.allowlist_csv,
+            usecols=['omni_clean', 'impression_clean'],
+            low_memory=False,
+        )
+        allow_keys = set(zip(
+            allowlist['omni_clean'].fillna('').astype(str),
+            allowlist['impression_clean'].fillna('').astype(str),
+        ))
+        row_keys = list(zip(
+            df_unique['omni_clean'].fillna('').astype(str),
+            df_unique['impression_clean'].fillna('').astype(str),
+        ))
+        df_unique = df_unique[[key in allow_keys for key in row_keys]].copy()
+        unique_output_keys = set(zip(
+            df_unique['omni_clean'].fillna('').astype(str),
+            df_unique['impression_clean'].fillna('').astype(str),
+        ))
+        if unique_output_keys != allow_keys or len(df_unique) != len(allowlist):
+            raise ValueError(
+                'Combined BERTScore rows do not exactly match the unique-pair allowlist: '
+                f'rows={len(df_unique):,}, output_keys={len(unique_output_keys):,}, '
+                f'allowlist={len(allowlist):,}'
+            )
+    for col in ['bert_precision', 'bert_recall', 'bert_f1']:
+        df_unique[col] = pd.to_numeric(df_unique[col], errors='coerce')
+    df_unique = df_unique[np.isfinite(df_unique['bert_f1'])].copy()
+
+    period_df = summarize(df_unique, ['period']).sort_values('period')
+    period_mod_df = summarize(df_unique, ['period', 'modality']).sort_values(['period', 'n_rows'], ascending=[True, False])
+    period_mod_reg_df = summarize(df_unique, ['period', 'modality', 'anatomic_region']).sort_values(
+        ['period', 'modality', 'n_rows'], ascending=[True, True, False]
+    )
+    kw_period_mod_df = kruskal_modalities_within_period(df_unique).sort_values('period')
+    kw_period_mod_reg_df = kruskal_regions_within_period_modality(df_unique).sort_values(['period', 'modality'])
+
+    out_used_rows = os.path.join(combined_dir, 'bert_score_period_modality_region_unique_pairs_used.csv')
+    out_period = os.path.join(combined_dir, 'bert_score_by_period.csv')
+    out_period_modality = os.path.join(combined_dir, 'bert_score_by_period_modality.csv')
+    out_period_modality_region = os.path.join(combined_dir, 'bert_score_by_period_modality_anatomic_region.csv')
+    out_kw_pm = os.path.join(combined_dir, 'bert_f1_kruskal_by_period_modality.csv')
+    out_kw_pmr = os.path.join(combined_dir, 'bert_f1_kruskal_by_period_modality_anatomic_region.csv')
+    out_results = os.path.join(combined_dir, 'bert_score_period_modality_region_results.txt')
+
+    df_unique.to_csv(out_used_rows, index=False)
+    period_df.to_csv(out_period, index=False)
+    period_mod_df.to_csv(out_period_modality, index=False)
+    period_mod_reg_df.to_csv(out_period_modality_region, index=False)
+    kw_period_mod_df.to_csv(out_kw_pm, index=False)
+    kw_period_mod_reg_df.to_csv(out_kw_pmr, index=False)
+
+    with open(out_results, 'w') as f:
+        f.write('BERTSCORE SHARD COMBINATION SUMMARY\n')
+        f.write('=' * 100 + '\n')
+        f.write(f'Model: {args.model_type}\n')
+        f.write(f'Expected shards: {args.num_shards}\n')
+        f.write(f'Found shards: {len(found)} ({found})\n')
+        if args.allowlist_csv:
+            f.write(f'Unique-pair allowlist: {args.allowlist_csv}\n')
+        f.write(f'Combined rows: {len(df_unique):,}\n')
+
+    print('Saved combined outputs to:')
+    print(f'  {combined_dir}')
+
+
+if __name__ == '__main__':
+    main()
