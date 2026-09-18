@@ -1,0 +1,275 @@
+import os
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+MAIN_DATA_PATH = '/data/aiiih/projects/singhk/radai/Data/CCF_dataset_wmetadata_v3.csv'
+EXCLUDED_DATA_PATH = '/data/aiiih/projects/singhk/radai/Data/CCF_dataset_excluded_invalid_radiologist_id_trial_full.csv'
+OUTPUT_DIR = '/data/aiiih/projects/singhk/radai/Output/Time_Saving_Analysis'
+MIN_RADAI_CASES = 100
+MAX_TIME_SECONDS = 60 * 60
+
+PRE_CUTOFF = pd.Timestamp('2025-06-02')
+POST_START = pd.Timestamp('2025-07-01')
+BOOTSTRAP_N = 2000
+RNG_SEED = 42
+
+OVERALL_CSV = f'{OUTPUT_DIR}/time_by_period_overall.csv'
+MODALITY_CSV = f'{OUTPUT_DIR}/time_by_period_modality.csv'
+PAIRED_CSV = f'{OUTPUT_DIR}/time_by_period_paired_radiologists.csv'
+RESULTS_TXT = f'{OUTPUT_DIR}/time_by_period_results.txt'
+RECOVERY_CSV = f'{OUTPUT_DIR}/username_recovered_rows_included.csv'
+
+USECOLS = ['radiologist_id', 'radiologist_user_name', 'collected_timestamp',
+           'n_inferences', 'time_on_impression', 'modality_server', 'modality_desc']
+
+
+def _clean_id(series):
+    out = series.astype(str).str.strip()
+    out.loc[out.str.lower().isin(['', 'nan', 'na', 'none'])] = np.nan
+    return out
+
+
+def _wilcoxon_safe(a, b):
+    if len(a) < 5:
+        return np.nan, np.nan
+    try:
+        stat, p = stats.wilcoxon(a, b, alternative='two-sided')
+        return float(stat), float(p)
+    except Exception:
+        return np.nan, np.nan
+
+
+def _bootstrap_median_ci(values, rng, n_boot=BOOTSTRAP_N):
+    if len(values) < 2:
+        return np.nan, np.nan
+    idx = rng.integers(0, len(values), size=(n_boot, len(values)))
+    meds = np.median(values[idx], axis=1)
+    lo, hi = np.percentile(meds, [2.5, 97.5])
+    return float(lo), float(hi)
+
+
+def _paired_within_group(df_sub, group_cols):
+    agg = (
+        df_sub.groupby(group_cols + ['radiologist_id', 'impression_type'], as_index=False)
+        .agg(time_on_impression=('time_on_impression', 'median'), n_records=('time_on_impression', 'count'))
+    )
+
+    rows = []
+    for keys, g in agg.groupby(group_cols + ['radiologist_id'], dropna=False):
+        types = set(g['impression_type'].tolist())
+        if not {'Free Text', 'RADAI'}.issubset(types):
+            continue
+        ft = g.loc[g['impression_type'] == 'Free Text'].iloc[0]
+        rd = g.loc[g['impression_type'] == 'RADAI'].iloc[0]
+
+        if isinstance(keys, tuple):
+            prefix = {col: val for col, val in zip(group_cols + ['radiologist_id'], keys)}
+        else:
+            prefix = {group_cols[0]: keys, 'radiologist_id': g['radiologist_id'].iloc[0]}
+
+        rows.append({
+            **prefix,
+            'free_text_time': float(ft['time_on_impression']),
+            'radai_time': float(rd['time_on_impression']),
+            'free_text_n': int(ft['n_records']),
+            'radai_n': int(rd['n_records']),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def summarize_pairs(df_pairs, group_cols):
+    out = []
+    if df_pairs.empty:
+        return pd.DataFrame(out)
+
+    rng = np.random.default_rng(RNG_SEED)
+    for keys, g in df_pairs.groupby(group_cols, dropna=False):
+        free = g['free_text_time'].values
+        radai = g['radai_time'].values
+        diffs = free - radai
+
+        w_stat, w_p = _wilcoxon_safe(free, radai)
+        free_ci_lo, free_ci_hi = _bootstrap_median_ci(free, rng)
+        radai_ci_lo, radai_ci_hi = _bootstrap_median_ci(radai, rng)
+        diff_ci_lo, diff_ci_hi = _bootstrap_median_ci(diffs, rng)
+        out_row = {
+            'n_paired_radiologists': int(len(g)),
+            'non_llm_impressions': int(g['free_text_n'].sum()),
+            'llm_impressions': int(g['radai_n'].sum()),
+            'total_impressions': int(g['free_text_n'].sum() + g['radai_n'].sum()),
+            'free_text_median_of_medians': float(np.median(free)),
+            'free_text_median_ci95_low': free_ci_lo,
+            'free_text_median_ci95_high': free_ci_hi,
+            'radai_median_of_medians': float(np.median(radai)),
+            'radai_median_ci95_low': radai_ci_lo,
+            'radai_median_ci95_high': radai_ci_hi,
+            'median_difference_free_minus_radai': float(np.median(diffs)),
+            'median_difference_ci95_low': diff_ci_lo,
+            'median_difference_ci95_high': diff_ci_hi,
+            'mean_difference_free_minus_radai': float(np.mean(diffs)),
+            'wilcoxon_stat': w_stat,
+            'wilcoxon_p_value': w_p,
+            'significant': 'Yes' if pd.notna(w_p) and w_p < 0.05 else 'No'
+        }
+
+        if isinstance(keys, tuple):
+            for col, val in zip(group_cols, keys):
+                out_row[col] = val
+        else:
+            out_row[group_cols[0]] = keys
+
+        out.append(out_row)
+
+    return pd.DataFrame(out)
+
+
+def load_combined_dataset():
+    main_df = pd.read_csv(MAIN_DATA_PATH, usecols=USECOLS, low_memory=False)
+    main_df['radiologist_id'] = _clean_id(main_df['radiologist_id'])
+    main_df['radiologist_user_name'] = _clean_id(main_df['radiologist_user_name']).str.upper()
+    main_df['source'] = 'main'
+
+    excluded_df = pd.read_csv(EXCLUDED_DATA_PATH, usecols=USECOLS, low_memory=False)
+    excluded_df['radiologist_id'] = _clean_id(excluded_df['radiologist_id'])
+    excluded_df['radiologist_user_name'] = _clean_id(excluded_df['radiologist_user_name']).str.upper()
+    excluded_df['source'] = 'excluded_invalid_id'
+
+    # Recovery mapping: username -> modal valid radiologist_id observed in main dataset
+    valid_main = main_df[main_df['radiologist_id'].notna()]
+    map_df = (
+        valid_main[valid_main['radiologist_user_name'].notna()]
+        .groupby(['radiologist_user_name', 'radiologist_id']).size().reset_index(name='n')
+        .sort_values(['radiologist_user_name', 'n', 'radiologist_id'], ascending=[True, False, True])
+        .drop_duplicates('radiologist_user_name', keep='first')
+    )
+    username_to_id = dict(zip(map_df['radiologist_user_name'], map_df['radiologist_id']))
+
+    # Only recover rows that are actually missing a valid radiologist_id (the whole file, by construction)
+    recoverable = excluded_df[excluded_df['radiologist_id'].isna() & excluded_df['radiologist_user_name'].notna()].copy()
+    recoverable['radiologist_id'] = recoverable['radiologist_user_name'].map(username_to_id)
+    unmapped = recoverable['radiologist_id'].isna()
+    recoverable.loc[unmapped, 'radiologist_id'] = 'UNAME::' + recoverable.loc[unmapped, 'radiologist_user_name']
+    recoverable['source'] = 'excluded_recovered_by_username'
+
+    combined = pd.concat([main_df, recoverable], ignore_index=True)
+    return combined, recoverable
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    df, recovered_rows = load_combined_dataset()
+
+    # Eligibility: >=100 RADAI impressions (same exclusion criteria as baseline)
+    is_radai = pd.to_numeric(df['n_inferences'], errors='coerce').fillna(0).ge(1)
+    radai_counts = df.loc[is_radai & df['radiologist_id'].notna()].groupby('radiologist_id').size()
+    eligible = set(radai_counts[radai_counts >= MIN_RADAI_CASES].index)
+    df = df[df['radiologist_id'].isin(eligible)].copy()
+
+    # Period assignment
+    df['ts'] = pd.to_datetime(df['collected_timestamp'], errors='coerce')
+    df = df[df['ts'].notna()].copy()
+    df['period'] = np.where(df['ts'] <= PRE_CUTOFF, 'pre', np.where(df['ts'] >= POST_START, 'post', 'gap'))
+    df = df[df['period'].isin(['pre', 'post'])].copy()
+
+    # Impression type
+    df['impression_type'] = np.where(pd.to_numeric(df['n_inferences'], errors='coerce').fillna(0).ge(1), 'RADAI', 'Free Text')
+
+    # Time filter (same exclusion criteria)
+    df['time_on_impression'] = pd.to_numeric(df['time_on_impression'], errors='coerce')
+    df = df[df['time_on_impression'].notna()].copy()
+    df = df[df['time_on_impression'] <= MAX_TIME_SECONDS].copy()
+
+    # Modality harmonization
+    df['modality'] = df['modality_server'].fillna(df['modality_desc']).fillna('UNKNOWN').astype(str).str.strip()
+    df.loc[df['modality'].str.lower().isin(['', 'nan', 'none', 'na']), 'modality'] = 'UNKNOWN'
+    df.loc[df['modality'].str.upper().isin(['CT', 'COMPUTED TOMOGRAPHY']), 'modality'] = 'CT'
+
+    # Overall by period
+    paired_period = _paired_within_group(df, ['period'])
+    overall = summarize_pairs(paired_period, ['period'])
+
+    # By period + modality
+    paired_period_mod = _paired_within_group(df, ['period', 'modality'])
+    mod = summarize_pairs(paired_period_mod, ['period', 'modality'])
+    if not mod.empty:
+        mod = mod.sort_values(['period', 'wilcoxon_p_value', 'n_paired_radiologists'], ascending=[True, True, False], na_position='last')
+
+    # Save
+    overall.to_csv(OVERALL_CSV, index=False)
+    mod.to_csv(MODALITY_CSV, index=False)
+    paired_period_mod.to_csv(PAIRED_CSV, index=False)
+
+    # Track which recovered rows actually survived every downstream filter
+    surviving_ids = set(zip(df['period'], df['radiologist_id']))
+    recovered_rows = recovered_rows.copy()
+    recovered_rows['ts'] = pd.to_datetime(recovered_rows['collected_timestamp'], errors='coerce')
+    recovered_rows['period'] = np.where(
+        recovered_rows['ts'] <= PRE_CUTOFF, 'pre',
+        np.where(recovered_rows['ts'] >= POST_START, 'post', 'gap')
+    )
+    recovered_rows['time_on_impression'] = pd.to_numeric(recovered_rows['time_on_impression'], errors='coerce')
+    recovered_rows['included_in_final_analysis'] = recovered_rows.apply(
+        lambda r: (r['period'], r['radiologist_id']) in surviving_ids
+        and pd.notna(r['time_on_impression']) and r['time_on_impression'] <= MAX_TIME_SECONDS
+        and r['radiologist_id'] in eligible,
+        axis=1,
+    )
+    recovered_rows.to_csv(RECOVERY_CSV, index=False)
+
+    n_recovered_total = len(recovered_rows)
+    n_recovered_included = int(recovered_rows['included_in_final_analysis'].sum())
+
+    with open(RESULTS_TXT, 'w') as f:
+        f.write('TIME SAVING ANALYSIS STRATIFIED BY IMPLEMENTATION PERIOD\n')
+        f.write('(includes username-recovered rows from excluded invalid-radiologist_id file)\n')
+        f.write('=' * 80 + '\n')
+        f.write(f'Main dataset: {MAIN_DATA_PATH}\n')
+        f.write(f'Excluded dataset: {EXCLUDED_DATA_PATH}\n')
+        f.write('Pairing key: radiologist_id (recovered via radiologist_user_name for excluded rows)\n')
+        f.write(f'Eligibility: radiologists with >= {MIN_RADAI_CASES} RADAI impressions\n')
+        f.write(f'Time filter: time_on_impression <= {MAX_TIME_SECONDS} seconds\n')
+        f.write(f'Pre period : collected_timestamp <= {PRE_CUTOFF.date()}\n')
+        f.write(f'Post period: collected_timestamp >= {POST_START.date()}\n')
+        f.write(f'Excluded rows with username-recoverable radiologist_id: {n_recovered_total}\n')
+        f.write(f'Recovered rows surviving all other criteria and included in analysis: {n_recovered_included}\n\n')
+
+        f.write('OVERALL BY PERIOD\n')
+        f.write('-' * 80 + '\n')
+        if overall.empty:
+            f.write('No paired radiologists found.\n')
+        else:
+            for _, r in overall.iterrows():
+                f.write(
+                    f"{r['period']}: n_paired_radiologists={int(r['n_paired_radiologists'])}, "
+                    f"FreeText_med={r['free_text_median_of_medians']:.2f}s "
+                    f"[{r['free_text_median_ci95_low']:.2f}, {r['free_text_median_ci95_high']:.2f}], "
+                    f"RADAI_med={r['radai_median_of_medians']:.2f}s "
+                    f"[{r['radai_median_ci95_low']:.2f}, {r['radai_median_ci95_high']:.2f}], "
+                    f"delta(Free-RADAI)={r['median_difference_free_minus_radai']:+.2f}s "
+                    f"[{r['median_difference_ci95_low']:+.2f}, {r['median_difference_ci95_high']:+.2f}], "
+                    f"p={r['wilcoxon_p_value']:.6g}\n"
+                )
+
+        f.write('\nMODALITY-STRATIFIED WITHIN PERIOD\n')
+        f.write('-' * 80 + '\n')
+        if mod.empty:
+            f.write('No period+modality strata with paired radiologists.\n')
+        else:
+            for _, r in mod.iterrows():
+                f.write(
+                    f"{r['period']} | {r['modality']}: n_paired_radiologists={int(r['n_paired_radiologists'])}, "
+                    f"FreeText_med={r['free_text_median_of_medians']:.2f}s "
+                    f"[{r['free_text_median_ci95_low']:.2f}, {r['free_text_median_ci95_high']:.2f}], "
+                    f"RADAI_med={r['radai_median_of_medians']:.2f}s "
+                    f"[{r['radai_median_ci95_low']:.2f}, {r['radai_median_ci95_high']:.2f}], "
+                    f"delta={r['median_difference_free_minus_radai']:+.2f}s "
+                    f"[{r['median_difference_ci95_low']:+.2f}, {r['median_difference_ci95_high']:+.2f}], "
+                    f"p={r['wilcoxon_p_value']:.6g}\n"
+                )
+
+
+if __name__ == '__main__':
+    main()
