@@ -1,0 +1,243 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+
+try:
+    import Levenshtein as Lev
+    _lev_lib = True
+except ImportError:
+    _lev_lib = False
+
+DATA_PATH = '/data/aiiih/projects/singhk/radai/Data/CCF_dataset_wmetadata_v3.csv'
+OUTPUT_DIR = '/data/aiiih/projects/singhk/radai/Output'
+MIN_RADAI_CASES = 100
+
+PRE_CUTOFF = pd.Timestamp('2025-06-02')
+POST_START = pd.Timestamp('2025-07-01')
+
+OUT_USED_ROWS = f'{OUTPUT_DIR}/edit_distance_period_modality_region_unique_pairs_used.csv'
+OUT_PERIOD = f'{OUTPUT_DIR}/edit_distance_by_period.csv'
+OUT_PERIOD_MODALITY = f'{OUTPUT_DIR}/edit_distance_by_period_modality.csv'
+OUT_PERIOD_MODALITY_REGION = f'{OUTPUT_DIR}/edit_distance_by_period_modality_anatomic_region.csv'
+OUT_RESULTS = f'{OUTPUT_DIR}/edit_distance_period_modality_region_results.txt'
+
+
+def clean_field(val):
+    if pd.isna(val):
+        return ''
+    s = str(val).strip()
+    if s.lower() in ('nan', 'na', 'none'):
+        return ''
+    s = re.sub(r'^impression\s*:?\s*', '', s, flags=re.IGNORECASE).strip()
+    s = s.rstrip('\n').strip()
+    return s
+
+
+def _lev_dist(s1, s2):
+    if _lev_lib:
+        return Lev.distance(s1, s2)
+    if len(s1) < len(s2):
+        return _lev_dist(s2, s1)
+    if not s2:
+        return len(s1)
+    prev = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        cur = [i + 1]
+        for j, c2 in enumerate(s2):
+            cur.append(min(prev[j + 1] + 1, cur[j] + 1, prev[j] + (c1 != c2)))
+        prev = cur
+    return prev[-1]
+
+
+def edit_distance(s1_raw, s2_raw):
+    s1 = clean_field(s1_raw).lower()
+    s2 = clean_field(s2_raw).lower()
+    if s1 == '':
+        return np.nan
+    if s2 == '':
+        return 0.0
+    return float(_lev_dist(s1, s2))
+
+
+def norm_edit_distance(s1_raw, s2_raw):
+    s1 = clean_field(s1_raw).lower()
+    s2 = clean_field(s2_raw).lower()
+    if s1 == '':
+        return np.nan
+    if s2 == '':
+        return 0.0
+    denom = max(len(s1), len(s2))
+    return float(_lev_dist(s1, s2)) / denom if denom else 0.0
+
+
+def word_norm_edit_distance(s1_raw, s2_raw):
+    s1 = clean_field(s1_raw).lower()
+    s2 = clean_field(s2_raw).lower()
+    if s1 == '':
+        return np.nan
+    if s2 == '':
+        return 0.0
+    denom = max(len(s1.split()), len(s2.split()))
+    return float(_lev_dist(s1, s2)) / denom if denom else 0.0
+
+
+def summarize(df, group_cols):
+    rows = []
+    for keys, g in df.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = {c: v for c, v in zip(group_cols, keys)}
+        row.update({
+            'n_rows': int(len(g)),
+            'char_edit_mean': float(g['edit_dist'].mean()),
+            'char_edit_median': float(g['edit_dist'].median()),
+            'char_edit_std': float(g['edit_dist'].std()),
+            'char_norm_mean': float(g['norm_edit_dist'].mean()),
+            'char_norm_median': float(g['norm_edit_dist'].median()),
+            'word_norm_mean': float(g['word_norm_edit_dist'].mean()),
+            'word_norm_median': float(g['word_norm_edit_dist'].median()),
+        })
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    return out
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    usecols = [
+        'radiologist_id', 'collected_timestamp', 'n_inferences',
+        'omni_impression', 'impression', 'modality_server', 'modality_desc', 'body_part'
+    ]
+    df = pd.read_csv(DATA_PATH, usecols=usecols, low_memory=False)
+    total_rows_raw = len(df)
+
+    # Keep same cohort rule: valid radiologist_id + >=100 RADAI cases
+    df['radiologist_id'] = df['radiologist_id'].astype(str).str.strip()
+    df.loc[df['radiologist_id'].str.lower().isin(['', 'nan', 'na', 'none']), 'radiologist_id'] = np.nan
+
+    is_radai_any = pd.to_numeric(df['n_inferences'], errors='coerce').fillna(0).ge(1)
+    radai_counts = df.loc[is_radai_any & df['radiologist_id'].notna()].groupby('radiologist_id').size()
+    eligible_rads = set(radai_counts[radai_counts >= MIN_RADAI_CASES].index)
+    df = df[df['radiologist_id'].isin(eligible_rads)].copy()
+
+    # RADAI rows only for edit-distance analysis
+    df = df[pd.to_numeric(df['n_inferences'], errors='coerce').fillna(0).ge(1)].copy()
+
+    # Implementation period assignment
+    df['ts'] = pd.to_datetime(df['collected_timestamp'], errors='coerce')
+    df = df[df['ts'].notna()].copy()
+    df['period'] = np.where(df['ts'] <= PRE_CUTOFF, 'pre', np.where(df['ts'] >= POST_START, 'post', 'gap'))
+    df = df[df['period'].isin(['pre', 'post'])].copy()
+
+    # Text cleaning
+    df['omni_clean'] = df['omni_impression'].apply(clean_field)
+    df['impression_clean'] = df['impression'].apply(clean_field)
+
+    # Need valid omni baseline
+    df = df[df['omni_clean'] != ''].copy()
+
+    # Keep only strictly unique omni/impression pairs (frequency == 1)
+    pair_counts = (
+        df.groupby(['omni_clean', 'impression_clean'], dropna=False)
+        .size()
+        .rename('pair_count')
+        .reset_index()
+    )
+    df = df.merge(pair_counts, on=['omni_clean', 'impression_clean'], how='left')
+    df_unique = df[df['pair_count'] == 1].copy()
+
+    # Region and modality harmonization
+    df_unique['modality'] = df_unique['modality_server'].fillna(df_unique['modality_desc']).fillna('UNKNOWN').astype(str).str.strip()
+    df_unique.loc[df_unique['modality'].str.lower().isin(['', 'nan', 'na', 'none']), 'modality'] = 'UNKNOWN'
+
+    df_unique['anatomic_region'] = df_unique['body_part'].fillna('UNKNOWN').astype(str).str.strip()
+    df_unique.loc[df_unique['anatomic_region'].str.lower().isin(['', 'nan', 'na', 'none']), 'anatomic_region'] = 'UNKNOWN'
+
+    # Compute edit distance metrics
+    df_unique['edit_dist'] = df_unique.apply(lambda r: edit_distance(r['omni_clean'], r['impression_clean']), axis=1)
+    df_unique['norm_edit_dist'] = df_unique.apply(lambda r: norm_edit_distance(r['omni_clean'], r['impression_clean']), axis=1)
+    df_unique['word_norm_edit_dist'] = df_unique.apply(lambda r: word_norm_edit_distance(r['omni_clean'], r['impression_clean']), axis=1)
+
+    df_unique = df_unique[np.isfinite(df_unique['edit_dist'])].copy()
+
+    # Summaries
+    period_df = summarize(df_unique, ['period']).sort_values('period')
+    period_mod_df = summarize(df_unique, ['period', 'modality']).sort_values(['period', 'n_rows'], ascending=[True, False])
+    period_mod_reg_df = summarize(df_unique, ['period', 'modality', 'anatomic_region']).sort_values(['period', 'modality', 'n_rows'], ascending=[True, True, False])
+
+    # Save outputs
+    cols_used = [
+        'radiologist_id', 'period', 'modality', 'anatomic_region',
+        'omni_clean', 'impression_clean', 'pair_count',
+        'edit_dist', 'norm_edit_dist', 'word_norm_edit_dist'
+    ]
+    df_unique[cols_used].to_csv(OUT_USED_ROWS, index=False)
+    period_df.to_csv(OUT_PERIOD, index=False)
+    period_mod_df.to_csv(OUT_PERIOD_MODALITY, index=False)
+    period_mod_reg_df.to_csv(OUT_PERIOD_MODALITY_REGION, index=False)
+
+    with open(OUT_RESULTS, 'w') as f:
+        f.write('EDIT DISTANCE ANALYSIS STRATIFIED BY IMPLEMENTATION PERIOD / MODALITY / ANATOMIC REGION\n')
+        f.write('=' * 100 + '\n')
+        f.write(f'Dataset: {DATA_PATH}\n')
+        f.write(f'Eligibility: radiologists with >= {MIN_RADAI_CASES} RADAI impressions\n')
+        f.write('Rows included: RADAI rows only (n_inferences >= 1), non-blank omni_impression\n')
+        f.write('Unique-pair rule: only rows where (omni_impression, impression) pair frequency == 1\n')
+        f.write(f'Pre period : collected_timestamp <= {PRE_CUTOFF.date()}\n')
+        f.write(f'Post period: collected_timestamp >= {POST_START.date()}\n\n')
+
+        f.write(f'Total rows loaded: {total_rows_raw:,}\n')
+        f.write(f'Rows after cohort/period/text filtering before unique-pair filter: {len(df):,}\n')
+        f.write(f'Rows retained after unique-pair filter: {len(df_unique):,}\n\n')
+
+        f.write('BY PERIOD\n')
+        f.write('-' * 100 + '\n')
+        if period_df.empty:
+            f.write('No rows available.\n')
+        else:
+            for _, r in period_df.iterrows():
+                f.write(
+                    f"{r['period']}: n={int(r['n_rows'])}, "
+                    f"char_median={r['char_edit_median']:.4f}, "
+                    f"char_norm_median={r['char_norm_median']:.4f}, "
+                    f"word_norm_median={r['word_norm_median']:.4f}\n"
+                )
+
+        f.write('\nBY PERIOD + MODALITY\n')
+        f.write('-' * 100 + '\n')
+        if period_mod_df.empty:
+            f.write('No rows available.\n')
+        else:
+            for _, r in period_mod_df.iterrows():
+                f.write(
+                    f"{r['period']} | {r['modality']}: n={int(r['n_rows'])}, "
+                    f"char_median={r['char_edit_median']:.4f}, "
+                    f"char_norm_median={r['char_norm_median']:.4f}, "
+                    f"word_norm_median={r['word_norm_median']:.4f}\n"
+                )
+
+        f.write('\nBY PERIOD + MODALITY + ANATOMIC REGION\n')
+        f.write('-' * 100 + '\n')
+        if period_mod_reg_df.empty:
+            f.write('No rows available.\n')
+        else:
+            for _, r in period_mod_reg_df.iterrows():
+                f.write(
+                    f"{r['period']} | {r['modality']} | {r['anatomic_region']}: n={int(r['n_rows'])}, "
+                    f"char_median={r['char_edit_median']:.4f}, "
+                    f"char_norm_median={r['char_norm_median']:.4f}, "
+                    f"word_norm_median={r['word_norm_median']:.4f}\n"
+                )
+
+    print('Saved:')
+    print(f'  {OUT_USED_ROWS}')
+    print(f'  {OUT_PERIOD}')
+    print(f'  {OUT_PERIOD_MODALITY}')
+    print(f'  {OUT_PERIOD_MODALITY_REGION}')
+    print(f'  {OUT_RESULTS}')
+
+
+if __name__ == '__main__':
+    main()
